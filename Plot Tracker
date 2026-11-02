@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Plot Tracker acceleration data in time and compute its amplitude spectrum.
+
+Input: UTF-8 text with two TAB-separated columns: time (s), acceleration (m/s²).
+Header lines and rows missing either value are skipped. The input acceleration
+has ALREADY been calculated by Tracker: this script does not track video or
+differentiate displacement. It converts acceleration to cm/s² and applies a
+real FFT to the mean-removed signal, after interpolation if samples are uneven.
+
+Usage, from the repository root:
+    python PlotTracker.py examples/tracker_acceleration.txt outputs/tracker_demo
+    python PlotTracker.py --help
+
+Outputs: <base>_tiempo.png and <base>_frecuencia.png. Without an output base,
+both images are saved beside the input. Plot labels remain in Spanish.
+
+See README.md for FFT normalization, peak interpretation, and the limits of
+resampling and timestamp correction. See CHANGELOG.md for functional changes.
+"""
+
+import argparse
+import os
+
+import matplotlib
+import numpy as np
+
+# File-only backend: this script saves images without opening a plot window.
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# USER SETTINGS: these limits control display ONLY, not FFT peak selection.
+FREQ_MAX_DEFAULT = 25.0             # Hz, frequency plot's upper x limit.
+ACEL_MAX_FRECUENCIA_DEFAULT = 40.0  # cm/s², spectrum's upper y limit.
+ACEL_MAX_TIEMPO_DEFAULT = 45.0      # cm/s², symmetric time plot's y limits.
+
+# USER TIMING SETTING: leave at 1.0 unless the time base is independently known
+# to need correction. 2.0 doubles timestamps and halves FFT frequencies; 0.5
+# does the reverse. The already exported acceleration values are NOT recomputed.
+# This cannot fix aliasing. For a physical timing correction, check the video
+# settings in Tracker and re-export acceleration with the correct time base.
+MULTIPLICADOR_TIEMPO = 1.0
+
+# USER INPUT PATH (OPTIONAL): set this only if running with an IDE's Run button.
+# A command-line path always takes priority. Empty means a path is required.
+# Windows example: r"C:\measurements\tracker.txt", or use forward slashes.
+ARCHIVO_ENTRADA = ""
+
+
+def leer_datos(ruta):
+    """Read valid paired time/acceleration values and convert m/s² to cm/s².
+
+    A literal tab is required between columns; decimal POINTS are expected.
+    Extra columns are ignored. Select/export t and the intended acceleration
+    component as the first two columns. NaN and infinity are rejected.
+    """
+    tiempos, aceleraciones = [], []
+    # utf-8-sig also accepts UTF-8 files that begin with a byte-order mark.
+    with open(ruta, "r", encoding="utf-8-sig") as stream:
+        for line_number, linea in enumerate(stream, start=1):
+            partes = linea.rstrip("\n").split("\t")
+            if len(partes) < 2:
+                continue
+            t_str, a_str = partes[0].strip(), partes[1].strip()
+            if not t_str or not a_str:
+                continue
+            try:
+                t_val, a_val = float(t_str), float(a_str)
+            except ValueError:
+                continue  # Tracker track names and column labels are headers.
+            if not np.isfinite(t_val) or not np.isfinite(a_val):
+                raise ValueError(f"Valor no finito en la línea {line_number}.")
+            tiempos.append(t_val)
+            aceleraciones.append(a_val)
+    if len(tiempos) < 2:
+        raise ValueError("No se han encontrado al menos dos pares de datos válidos.")
+    return np.array(tiempos), np.array(aceleraciones) * 100.0
+
+
+def aplicar_factor_tiempo(t):
+    """Rescale timestamps only; acceleration amplitudes remain unchanged."""
+    if not np.isfinite(MULTIPLICADOR_TIEMPO) or MULTIPLICADOR_TIEMPO <= 0:
+        raise ValueError("MULTIPLICADOR_TIEMPO debe ser finito y mayor que cero.")
+    return t * MULTIPLICADOR_TIEMPO
+
+
+def preparar_muestreo_uniforme(t, a):
+    """Validate time ordering and interpolate uneven samples onto a regular grid.
+
+    The nominal step is the median consecutive time difference. As in the
+    supplied script, np.arange excludes the final endpoint when interpolating.
+    Interpolation estimates missing values; it does not restore measured data.
+    """
+    t, a = np.asarray(t, dtype=float), np.asarray(a, dtype=float)
+    if t.ndim != 1 or a.ndim != 1 or len(t) != len(a) or len(t) < 2:
+        raise ValueError("Se requieren dos arrays 1D del mismo tamaño (al menos 2).")
+    if not np.all(np.isfinite(t)) or not np.all(np.isfinite(a)):
+        raise ValueError("Los datos contienen NaN o valores infinitos.")
+    dt_diffs = np.diff(t)
+    if np.any(dt_diffs <= 0):
+        raise ValueError("Los tiempos deben ser estrictamente crecientes, sin duplicados.")
+    dt_nominal = np.median(dt_diffs)
+    if np.allclose(dt_diffs, dt_nominal, rtol=1e-3, atol=1e-6):
+        return t, a, dt_nominal
+
+    print("Aviso: muestreo temporal no uniforme. Se interpola con "
+          f"dt = {dt_nominal:.6f} s; revisa los huecos del registro original.")
+    t_uniforme = np.arange(t[0], t[-1], dt_nominal)
+    a_uniforme = np.interp(t_uniforme, t, a)
+    if len(t_uniforme) < 2:
+        raise ValueError("El registro es demasiado corto tras el remuestreo.")
+    return t_uniforme, a_uniforme, dt_nominal
+
+
+def calcular_fft(t, a):
+    """Return Hz and a one-sided PEAK amplitude spectrum, in the input a unit.
+
+    The mean is removed; no explicit taper/window, zero padding, or smoothing
+    is applied. Interior positive-frequency bins are doubled to include their
+    negative-frequency partners. DC and the even-N Nyquist bin are not doubled.
+    For a sinusoid at an FFT bin, this gives its peak amplitude (not RMS/PSD).
+    """
+    n = len(a)
+    dt = np.median(np.diff(t))
+    a_centrada = a - np.mean(a)
+    espectro = np.fft.rfft(a_centrada)
+    frecuencias = np.fft.rfftfreq(n, d=dt)
+    amplitud = np.abs(espectro) / n
+    if n % 2 == 0:
+        amplitud[1:-1] *= 2.0
+    else:
+        amplitud[1:] *= 2.0
+    return frecuencias, amplitud
+
+
+def frecuencia_pico(frecuencias, amplitud):
+    """Find the largest positive-frequency bin across the ENTIRE spectrum.
+
+    Plot limits do not constrain this search. A stationary record has no
+    meaningful dominant oscillation even if a numerical bin is returned.
+    """
+    idx_validos = np.where(frecuencias > 0)[0]
+    idx_pico = idx_validos[np.argmax(amplitud[idx_validos])]
+    return frecuencias[idx_pico], amplitud[idx_pico]
+
+
+def calcular_amplitud_senal(a):
+    """Return maximum, minimum, and half the peak-to-peak acceleration range.
+
+    (max-min)/2 equals sinusoidal peak amplitude only for a suitable signal;
+    it is not generally max(a), max(abs(a)), RMS, or the largest FFT amplitude.
+    """
+    a_max, a_min = float(np.max(a)), float(np.min(a))
+    return a_max, a_min, (a_max - a_min) / 2.0
+
+
+def graficar_tiempo(t, a, ruta_salida, acel_max=ACEL_MAX_TIEMPO_DEFAULT):
+    """Save the time signal and a table of its half peak-to-peak range."""
+    _, _, amplitud = calcular_amplitud_senal(a)
+    fig = plt.figure(figsize=(10, 6.8))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 0.9], hspace=0.4)
+    ax, ax_tab = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
+    ax.plot(t, a, color="#2E5EAA", linewidth=1)
+    ax.set_xlabel("Tiempo (s)")
+    ax.set_ylabel(r"Aceleración $a_x$ (cm/s$^2$)")
+    ax.set_ylim(-acel_max, acel_max)
+    ax.set_title("Aceleración en función del tiempo")
+    ax.grid(alpha=0.3)
+    ax_tab.axis("off")
+    tabla = ax_tab.table(
+        cellText=[["Semiamplitud (máx. − mín.) / 2", f"{amplitud:.2f} cm/s²"]],
+        colLabels=["Magnitud", "Valor"], cellLoc="center", loc="center",
+    )
+    tabla.auto_set_font_size(False)
+    tabla.set_fontsize(10)
+    tabla.scale(1, 1.7)
+    fig.savefig(ruta_salida, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def graficar_frecuencia(frecuencias, amplitud, f_pico, a_pico, ruta_salida,
+                        freq_max=FREQ_MAX_DEFAULT, acel_max=ACEL_MAX_FRECUENCIA_DEFAULT):
+    """Save the one-sided spectrum, its global peak, and a summary table."""
+    fig = plt.figure(figsize=(10, 7))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 0.9], hspace=0.4)
+    ax_f, ax_tab = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
+    ax_f.plot(frecuencias, amplitud, color="#C0392B", linewidth=1.2)
+    ax_f.plot(f_pico, a_pico, "o", color="black", zorder=5, markersize=5)
+    ax_f.set_xlim(0, freq_max)
+    ax_f.set_ylim(0, acel_max)
+    ax_f.annotate(
+        f"f = {f_pico:.3f} Hz\na = {a_pico:.2f} cm/s²",
+        xy=(f_pico, a_pico), xycoords="data",
+        xytext=(0.60, 0.85), textcoords="axes fraction",
+        arrowprops=dict(arrowstyle="->", color="black", lw=0.8), fontsize=9,
+    )
+    ax_f.set_xlabel("Frecuencia (Hz)")
+    ax_f.set_ylabel(r"Amplitud (cm/s$^2$)")
+    ax_f.set_title("Espectro de amplitud (FFT)")
+    ax_f.grid(alpha=0.3)
+    ax_tab.axis("off")
+    tabla = ax_tab.table(
+        cellText=[["Frecuencia del pico espectral", f"{f_pico:.3f} Hz"],
+                  ["Amplitud del pico espectral", f"{a_pico:.2f} cm/s²"]],
+        colLabels=["Magnitud", "Valor"], cellLoc="center", loc="center",
+    )
+    tabla.auto_set_font_size(False)
+    tabla.set_fontsize(10)
+    tabla.scale(1, 1.8)
+    fig.savefig(ruta_salida, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _positivo(value):
+    """argparse validator for finite, positive display limits."""
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Indica un número.") from exc
+    if not np.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("El valor debe ser finito y mayor que cero.")
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Representa la aceleración exportada de Tracker y calcula su FFT."
+    )
+    parser.add_argument("archivo_entrada", nargs="?", default=None,
+                        help="Texto UTF-8 con columnas t (s), a_x (m/s²), separadas por tabulador. "
+                             "Si se omite, se usa ARCHIVO_ENTRADA.")
+    parser.add_argument("archivo_salida", nargs="?", default=None,
+                        help="Base de salida opcional: genera <base>_tiempo.png "
+                             "y <base>_frecuencia.png.")
+    parser.add_argument("--freq-max", type=_positivo, default=FREQ_MAX_DEFAULT,
+                        help=f"Límite visible de frecuencia en Hz (defecto: {FREQ_MAX_DEFAULT}).")
+    parser.add_argument("--acel-max-tiempo", type=_positivo, default=ACEL_MAX_TIEMPO_DEFAULT,
+                        help=f"Límite visible ± de aceleración temporal, cm/s² "
+                             f"(defecto: {ACEL_MAX_TIEMPO_DEFAULT}).")
+    parser.add_argument("--acel-max-frecuencia", type=_positivo,
+                        default=ACEL_MAX_FRECUENCIA_DEFAULT,
+                        help=f"Límite visible de amplitud FFT, cm/s² "
+                             f"(defecto: {ACEL_MAX_FRECUENCIA_DEFAULT}).")
+    args = parser.parse_args()
+    ruta_entrada = args.archivo_entrada or ARCHIVO_ENTRADA
+    if not ruta_entrada:
+        parser.error("Indica un archivo: python PlotTracker.py archivo.txt, "
+                     "o configura ARCHIVO_ENTRADA.")
+    if not os.path.isfile(ruta_entrada):
+        parser.error(f"No se encuentra el archivo: {ruta_entrada}")
+
+    # Keep the original output naming behavior. Without an explicit extension,
+    # PNG is used; an optional Matplotlib-supported extension is also accepted.
+    if args.archivo_salida:
+        base, ext = os.path.splitext(args.archivo_salida)
+        ext = ext or ".png"
+    else:
+        base, _ = os.path.splitext(ruta_entrada)
+        ext = ".png"
+    ruta_tiempo = f"{base}_tiempo{ext}"
+    ruta_frecuencia = f"{base}_frecuencia{ext}"
+
+    try:
+        t, a = leer_datos(ruta_entrada)
+        t = aplicar_factor_tiempo(t)
+        if MULTIPLICADOR_TIEMPO != 1.0:
+            print(f"Factor de tiempo: ×{MULTIPLICADOR_TIEMPO}; "
+                  "la aceleración exportada no se recalcula.")
+        t, a, dt = preparar_muestreo_uniforme(t, a)
+        frecuencias, amplitud = calcular_fft(t, a)
+        f_pico, a_pico = frecuencia_pico(frecuencias, amplitud)
+        os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
+        graficar_tiempo(t, a, ruta_tiempo, acel_max=args.acel_max_tiempo)
+        graficar_frecuencia(frecuencias, amplitud, f_pico, a_pico, ruta_frecuencia,
+                           freq_max=args.freq_max, acel_max=args.acel_max_frecuencia)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    a_max, a_min, amplitud_senal = calcular_amplitud_senal(a)
+    print(f"Archivo leído: {ruta_entrada}")
+    print(f"Muestras procesadas: {len(a)} | dt: {dt:.6f} s | fs: {1/dt:.3f} Hz")
+    print(f"Semiamplitud temporal: {amplitud_senal:.2f} cm/s² "
+          f"(máx. {a_max:.2f} / mín. {a_min:.2f})")
+    print(f"Pico espectral: {f_pico:.4f} Hz | {a_pico:.2f} cm/s²")
+    print(f"Gráfica temporal: {ruta_tiempo}")
+    print(f"Gráfica frecuencial: {ruta_frecuencia}")
+
+
+if __name__ == "__main__":
+    main()
