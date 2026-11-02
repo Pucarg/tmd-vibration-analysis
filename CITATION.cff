@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use these scripts in academic work, please cite this software."
+type: software
+title: "Tuned Mass Damper Vibration Analysis"
+authors:
+  - family-names: "Úcar Gargallo"
+    given-names: "Pablo"
+abstract: >-
+  Python post-processing tools for PULSE acceleration spectra and Tracker
+  time-domain acceleration exports, developed in the context of an experimental
+  undergraduate thesis on a mass-spring tuned mass damper.
+keywords:
+  - tuned mass damper
+  - vibration analysis
+  - acceleration
+  - FFT
+  - PULSE
+  - Tracker

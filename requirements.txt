@@ -1,0 +1,3 @@
+# Top-level dependency versions used to validate this repository (Python 3.12).
+numpy==2.3.5
+matplotlib==3.10.8
